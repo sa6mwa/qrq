@@ -1,7 +1,7 @@
 /* 
 Copyright (C) 2011  Fabian Kurz
 
-$Id: pulseaudio.h 203 2011-03-21 22:55:21Z dj1yfk $
+$Id$
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -22,7 +22,7 @@ Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #define QRQ_PA
 
 void *open_dsp (); 
-void write_audio (void *bla, int *in, int size);
+void write_audio (void *unused, int *in, int size);
 void close_audio (void *s);
 
 #endif

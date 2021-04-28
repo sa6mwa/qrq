@@ -1,8 +1,7 @@
 /* 
 qrq - High speed morse trainer, similar to the DOS classic "Rufz"
-Copyright (C) 2006-2013  Fabian Kurz
 
-$Id: qrq.c 564 2013-01-06 13:25:46Z dj1yfk $
+Copyright (C) 2006-2019  Fabian Kurz and contributors
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -20,6 +19,7 @@ Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */ 
 #if WIN32
 #define WIN_THREADS
+typedef int AUDIO_HANDLE;
 #endif
 
 #ifndef WIN_THREADS
@@ -32,6 +32,11 @@ Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <ctype.h>
 #include <time.h> 
 #include <limits.h> 			/* PATH_MAX */
+
+#ifndef PATH_MAX				/* Not defined e.g. on GNU/hurd */
+#define PATH_MAX 4096 
+#endif
+
 #include <dirent.h>
 #include <math.h>
 #include <fcntl.h>
@@ -39,6 +44,7 @@ Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <sys/stat.h>			/* mkdir */
 #include <sys/types.h>
 #include <errno.h>
+#include <stdio.h>
 #ifdef WIN32
 #include <windows.h>
 #endif
@@ -125,7 +131,7 @@ static int full_bufpos = 0;
 AUDIO_HANDLE dsp_fd;
 
 static int display_toplist();
-static int calc_score (char * realcall, char * input, int speed, char * output);
+static int calc_score (char * realcall, char * input, int speed, char * output, int f6pressed);
 static int update_score();
 static int show_error (char * realcall, char * wrongcall); 
 static int clear_display();
@@ -148,6 +154,8 @@ static void callbase_dialog();
 static void parameter_dialog();
 static int clear_parameter_display();
 static void update_parameter_dialog();
+static void start_summary_file();
+static void close_summary_file();
 
 #ifdef WIN_THREADS
 HANDLE cwthread;
@@ -160,9 +168,12 @@ pthread_attr_t cwattr;
 char rcfilename[PATH_MAX]="";			/* filename and path to qrqrc */
 char tlfilename[PATH_MAX]="";			/* filename and path to toplist */
 char cbfilename[PATH_MAX]="";			/* filename and path to callbase */
+char sumfilepath[PATH_MAX]="";			/* path where to save summary files for each attempt */
 
 char destdir[PATH_MAX]="";
 
+char summary[65536]="";                 /* detailled attempt summary, saved in a file */
+int s_pos = 0;                          /* Position within summary */
 
 /* create windows */
 WINDOW *top_w;					/* actual score					*/
@@ -206,7 +217,7 @@ int main (int argc, char *argv[]) {
 	keypad(stdscr, TRUE);
 	scrollok(stdscr, FALSE);
 	
-	printw("qrq v%s - Copyright (C) 2006-2013 Fabian Kurz, DJ1YFK\n", VERSION);
+	printw("qrq v%s - Copyright (C) 2006-2019 Fabian Kurz, DJ1YFK\n", VERSION);
 	printw("This is free software, and you are welcome to redistribute it\n");
 	printw("under certain conditions (see COPYING).\n");
 
@@ -276,7 +287,7 @@ int main (int argc, char *argv[]) {
 	keypad(conf_w, TRUE);
 
 #ifdef WIN_THREADS
-	cwthread = (HANDLE) _beginthread( morse,0,"QRQ");
+	cwthread = (HANDLE) _beginthreadex( NULL, 0, morse,"QRQ",0, NULL);
 #else
 	/* no need to join here, this is the first possible time CW is sent */
 	pthread_create(&cwthread, NULL, & morse, (void *) "QRQ");
@@ -352,7 +363,8 @@ while (status == 1) {
 		freq = constanttone ? ctonefreq : 800;
 #ifdef WIN_THREADS
 		 WaitForSingleObject(cwthread,INFINITE);
-		 cwthread = (HANDLE) _beginthread( morse,0,"VVVTEST");
+		 CloseHandle(cwthread);
+		 cwthread = (HANDLE) _beginthreadex( NULL, 0, morse,"VVVTEST",0, NULL);
 #else
 		pthread_join(cwthread, NULL);
 		j = pthread_create(&cwthread, NULL, &morse, (void *) "VVVTEST");	
@@ -394,12 +406,14 @@ while (status == 1) {
 	nrofcalls = read_callbase();
 
 	/****** send 50 or unlimited calls, ask for input, score ******/
+    start_summary_file();
 	
 	for (callnr=1; callnr < (unlimitedattempt ? nrofcalls : 51); callnr++) {
 		/* Make sure to wait for the cwthread of the previous callsign, if
 		 * necessary. */
 #ifdef WIN_THREADS
 		WaitForSingleObject(cwthread,INFINITE);
+		CloseHandle(cwthread);
 #else
 		pthread_join(cwthread, NULL);
 #endif	
@@ -434,7 +448,7 @@ while (status == 1) {
 		
 		sending_complete = 0;	
 #ifdef WIN_THREADS
-		cwthread = (HANDLE) _beginthread( morse,0,calls[i]);
+		cwthread = (HANDLE) _beginthreadex( NULL, 0, morse,calls[i],0, NULL);
 #else
 		j = pthread_create(&cwthread, NULL, morse, calls[i]);	
 		thread_fail(j);		
@@ -454,7 +468,8 @@ while (status == 1) {
 			
 #ifdef WIN_THREADS
 			WaitForSingleObject(cwthread,INFINITE);
-			cwthread = (HANDLE) _beginthread( morse,0,calls[i]);
+			CloseHandle(cwthread);
+			cwthread = (HANDLE) _beginthreadex( NULL, 0, morse,calls[i],0, NULL);
 #else
 			pthread_join(cwthread, NULL);
 			j = pthread_create(&cwthread, NULL, &morse, calls[i]);	
@@ -467,8 +482,10 @@ while (status == 1) {
 						freq = previousfreq;
 #ifdef WIN_THREADS
 			WaitForSingleObject(cwthread,INFINITE);
-			cwthread = (HANDLE) _beginthread( morse,0,previouscall);
+			CloseHandle(cwthread);
+			cwthread = (HANDLE) _beginthreadex( NULL, 0, morse,previouscall,0, NULL);
 			WaitForSingleObject(cwthread,INFINITE);
+			CloseHandle(cwthread);
 #else
 			pthread_join(cwthread, NULL);
 			j = pthread_create(&cwthread, NULL, &morse, previouscall);	
@@ -496,10 +513,10 @@ while (status == 1) {
 			break;
 		}
 		
-		tmp[0]='\0';	
-		score += calc_score(calls[i], input, speed, tmp);
+		tmp[0]='\0';
+		score += calc_score(calls[i], input, speed, tmp, f6pressed);
 		update_score();
-		if (strcmp(tmp, "*")) {			/* made an error */
+		if (strcmp(tmp, "-")) {			/* made an error */
 				show_error(calls[i], tmp);
 		}
 		input[0]='\0';
@@ -508,12 +525,15 @@ while (status == 1) {
 		calls[i] = NULL;
 	}
 
+    close_summary_file();
+
 	/* attempt is over, send AR */
 	callnr = 0;
 	
 #ifdef WIN_THREADS
 		 WaitForSingleObject(cwthread,INFINITE);
-		 cwthread = (HANDLE) _beginthread( morse,0,"+");
+		 CloseHandle(cwthread);
+		 cwthread = (HANDLE) _beginthreadex( NULL, 0, morse,"+",0, NULL);
 #else
 		pthread_join(cwthread, NULL);
 		j = pthread_create(&cwthread, NULL, &morse, (void *) "+");	
@@ -662,7 +682,8 @@ while ((j = getch()) != 0) {
 			freq = constanttone ? ctonefreq : 800;
 #ifdef WIN_THREADS
 		 WaitForSingleObject(cwthread,INFINITE);
-		 cwthread = (HANDLE) _beginthread( morse,0,"TESTING");
+		 CloseHandle(cwthread);
+		 cwthread = (HANDLE) _beginthreadex( NULL, 0, morse,"TESTING",0, NULL);
 #else
 		pthread_join(cwthread, NULL);
 		j = pthread_create(&cwthread, NULL, &morse, (void *) "TESTING");	
@@ -827,7 +848,7 @@ static int readline(WINDOW *win, int y, int x, char *line, int capitals) {
 			break;
 
 		if (((c > 64 && c < 91) || (c > 96 && c < 123) || (c > 47 && c < 58)
-					 || c == '/') && strlen(line) < 14) {
+					 || c == '/' || c == ' ') && strlen(line) < 14) {
 	
 			line[strlen(line)+1]='\0';
 			if (capitals) {
@@ -908,8 +929,10 @@ static int readline(WINDOW *win, int y, int x, char *line, int capitals) {
 			speed = 200; freq = 800;
 #ifdef WIN_THREADS
 		 WaitForSingleObject(cwthread,INFINITE);
-		 cwthread = (HANDLE) _beginthread( morse,0,"73");
+		 CloseHandle(cwthread);
+		 cwthread = (HANDLE) _beginthreadex( NULL, 0, morse,"73",0, NULL);
 		 WaitForSingleObject(cwthread,INFINITE);
+		 CloseHandle(cwthread);
 #else
 		pthread_join(cwthread, NULL);
 		j = pthread_create(&cwthread, NULL, &morse, (void *) "73");	
@@ -964,21 +987,19 @@ static int display_toplist () {
  *
  * in training modes (unlimited attempts, f6, fixed speed), no points.
  * */
-static int calc_score (char * realcall, char * input, int spd, char * output) {
+static int calc_score (char * realcall, char * input, int spd, char * output, int f6pressed) {
 	int i,x,m=0;
+    int score = 0;
 
 	x = strlen(realcall);
 
 	if (strcmp(input, realcall) == 0) {		 /* exact match! */
-		output[0]='*';						/* * == OK, no mistake */
+		output[0]='-';						/* * == OK, no mistake */
 		output[1]='\0';	
 		if (speed > maxspeed) {maxspeed = speed;}
 		if (!fixspeed) speed += 10;
 		if (attemptvalid) {
-			return 2*x*spd;						/* score */
-		}
-		else {
-			return 0;
+            score =  2*x*spd;						/* score */
 		}
 	}
 	else {									/* assemble error string */
@@ -998,10 +1019,60 @@ static int calc_score (char * realcall, char * input, int spd, char * output) {
 
 		/* score when 1-3 mistakes was made */
 		if ((m < 4) && attemptvalid) {
-			return (int) (2*x*spd)/(5*m);
+			score = (int) (2*x*spd)/(5*m);
 		}
-		else {return 0;};
 	}
+
+    s_pos += sprintf(summary + s_pos, "%-16s %-16s %-16s %3d %3d %5d %c\r\n", realcall, input, output, spd, spd/5, score, f6pressed ? '*' : ' ');
+
+    return score;
+}
+
+static void start_summary_file () {
+    s_pos = 0;
+    s_pos += sprintf(summary + s_pos, "QRQ attempt by %s.\r\n\r\n", mycall);
+    s_pos += sprintf(summary + s_pos, "%-16s %-16s %-16s %-3s %-3s %-5s %s\r\n", "Sent call", "Input", "Difference", "CpM", "WpM", "Score", "F6");
+    s_pos += sprintf(summary + s_pos, "--------------------------------------------------------------------\r\n");
+}
+
+static void close_summary_file () {
+    FILE *fh;
+    time_t t;
+    struct tm *tmp;
+    char time_fmt[256];
+    char filename[PATH_MAX];
+
+    t = time(NULL);
+    tmp = localtime(&t);
+    if (tmp == NULL) {
+        return;
+    }
+
+    if (strftime(time_fmt, sizeof(time_fmt), "%Y%m%d_%H%M", tmp) == 0) {
+        return;
+    }
+
+    s_pos += sprintf(summary + s_pos, "--------------------------------------------------------------------\r\n");
+    s_pos += sprintf(summary + s_pos, "Score: %d, Max. speed (CpM/WpM): %d / %d\r\nSaved at: %s\r\n", score, maxspeed, maxspeed/5, time_fmt);
+
+    snprintf(filename, PATH_MAX, "%s/%s-%s.txt", sumfilepath, mycall, time_fmt);
+
+	if ((fh = fopen(filename, "w")) == NULL) {
+		printf("Unable to open summary file (%s)!\r\n", filename);
+		exit(EXIT_FAILURE);
+	}
+
+    fwrite(summary, 1, s_pos, fh);
+    fclose(fh);
+	
+    for (int i = 12; i <= 15; i++) {
+        mvwprintw(mid_w,i,2, "                                                         ");
+    }
+
+	mvwprintw(mid_w,13,1, " Written detailled summary of this attempt to:");
+	mvwprintw(mid_w,14,2, filename);
+    wrefresh(mid_w);
+
 }
 
 /* print score, current speed and max speed to window */
@@ -1325,6 +1396,8 @@ static int read_config () {
 		}
 	}
 
+	fclose(fh);
+
 	printw("Finished reading qrqrc.\n");
 	return 0;
 }
@@ -1405,6 +1478,9 @@ static void *morse(void *arg) {
 		else if (c == '+') {
 			code = ".-.-.";
 		}
+        else if (c == ' ') {        /* space */
+            code = " ";
+        }
 		else {						/* not supposed to happen! */
 			code = "..--..";
 		}
@@ -1417,10 +1493,13 @@ static void *morse(void *arg) {
 				tonegen(freq, dotlen + ed, waveform);
 				tonegen(0, fulldotlen - ed, SILENCE);
 			}
-			else {
+			else if (c == '-') {
 				tonegen(freq, dashlen + ed, waveform);
 				tonegen(0, fulldotlen - ed, SILENCE);
 			}
+            else {  /* space */
+				tonegen(0, dotlen, SILENCE);
+            }
 		}
 		if (farnsworth) {
 			tonegen(0, 3*fwdotlen - fulldotlen, SILENCE);
@@ -1509,7 +1588,7 @@ static int tonegen (int freq, int len, int waveform) {
 
 static int save_config () {
 	FILE *fh;
-	char tmp[80]="";
+	char tmp[4096]="";
 	char confopts[12][80] = {
 		"\ncallsign=", 
 		"\ncallbase=",
@@ -1720,9 +1799,9 @@ static int find_files () {
 	
 	FILE *fh;
 	const char *homedir = NULL;
-	char tmp_rcfilename[1024] = "";
-	char tmp_tlfilename[1024] = "";
-	char tmp_cbfilename[1024] = "";
+	char tmp_rcfilename[PATH_MAX] = "";
+	char tmp_tlfilename[PATH_MAX] = "";
+	char tmp_cbfilename[PATH_MAX] = "";
 
 	printw("\nChecking for necessary files (qrqrc, toplist, callbase)...\n");
 	
@@ -1731,16 +1810,14 @@ static int find_files () {
 		((fh = fopen("callbase.qcb", "r")) == NULL)) {
 		
 		if ((homedir = getenv("HOME")) != NULL) {
-		printw("... not found in current directory. Checking "
-						"%s/.qrq/...\n", homedir);
-		refresh();
-		strcat(rcfilename, homedir);
+    		printw("... not found in current directory. Checking %s/.qrq/...\n", homedir);
+    		refresh();
+	    	strcat(rcfilename, homedir);
 		}
 		else {
-		printw("... not found in current directory. Checking "
-						"./.qrq/...\n", homedir);
-		refresh();
-		strcat(rcfilename, ".");
+		    printw("... not found in current directory. Checking ./.qrq/...\n");
+    		refresh();
+	    	strcat(rcfilename, ".");
 		}
 				
 		strcat(rcfilename, "/.qrq/qrqrc");
@@ -1789,6 +1866,7 @@ static int find_files () {
 					endwin();
 					exit(EXIT_FAILURE);
 				}
+
 				/* OK, now we created the directory, we can read in
 				 * DESTDIR/local/, so I assume copying files won't cause any
 				 * problem, with system()... */
@@ -1822,14 +1900,18 @@ static int find_files () {
 				strcpy(tlfilename, homedir);
 				strcat(tlfilename, "/.qrq/toplist");
 				strcpy(cbfilename, tmp_cbfilename);
+                strcpy(sumfilepath, homedir);
+                strcat(sumfilepath, "/.qrq/Summary");
 			} /* found in DESTDIR/share/qrq/ */
 		}
 		else {
 			printw("... found files in %s/.qrq/.\n", homedir);
-			strcat(tlfilename, homedir);
+			strcpy(tlfilename, homedir);
 			strcat(tlfilename, "/.qrq/toplist");
 			strcpy(cbfilename, destdir);
 			strcat(cbfilename, "/share/qrq/callbase.qcb");
+            strcpy(sumfilepath, homedir);
+            strcat(sumfilepath, "/.qrq/Summary");
 		}
 	}
 	else {
@@ -1837,7 +1919,13 @@ static int find_files () {
 		strcpy(rcfilename, "qrqrc");
 		strcpy(tlfilename, "toplist");
 		strcpy(cbfilename, "callbase.qcb");
+        strcpy(sumfilepath, "Summary");
 	}
+#ifdef WIN32
+    mkdir(sumfilepath);
+#else
+    mkdir(sumfilepath, 0777);
+#endif
 	refresh();
 	fclose(fh);
 	return 0;
@@ -1888,7 +1976,7 @@ static int statistics () {
 		fclose(fh);
 		fclose(fh2);
 
-		system("gnuplot /tmp/qrq-plot 2> /dev/null &");
+		system("gnuplot -p /tmp/qrq-plot 2> /dev/null &");
 	return 0;
 }
 
@@ -1926,8 +2014,14 @@ int read_callbase () {
 	}
 
 	/* allocate memory for calls array, free if needed */
-
-	free(calls);
+    if (calls) {
+        for (i = 0; i < nrofcalls; i++) {
+            free(calls[i]);
+            calls[i] = NULL;
+        }
+        free(calls);
+        calls = NULL;
+    }
 
 	if ((calls = (char **) malloc( (size_t) sizeof(char *)*nr )) == NULL) {
 		fprintf(stderr, "Error: Couldn't allocate %d bytes!\n", 
@@ -2090,7 +2184,7 @@ void select_callbase () {
 
 
 void help () {
-		printf("qrq v%s  (c) 2006-2013 Fabian Kurz, DJ1YFK. "
+		printf("qrq v%s  (c) 2006-2019 Fabian Kurz, DJ1YFK. "
 					"http://fkurz.net/ham/qrq.html\n", VERSION);
 		printf("High speed morse telegraphy trainer, similar to"
 					" RUFZ.\n\n");
@@ -2098,7 +2192,10 @@ void help () {
 						" redistribute it\n");
 		printf("under certain conditions (see COPYING).\n\n");
 		printf("Start 'qrq' without any command line arguments for normal"
-					" operation.\n");
+					" operation.\n\n");
+#ifdef BUILD_INFO
+        printf("Build info for this executable:\n%s\n", BUILD_INFO);
+#endif
 		exit(0);
 }
 
